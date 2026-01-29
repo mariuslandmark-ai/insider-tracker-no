@@ -2,7 +2,7 @@ name: Daily update
 
 on:
   schedule:
-    - cron: "15 6 * * *"   # 06:15 UTC (07:15 norsk vintertid)
+    - cron: "0 5,7,9,11,13,15,17 * * *"
   workflow_dispatch:
 
 permissions:
