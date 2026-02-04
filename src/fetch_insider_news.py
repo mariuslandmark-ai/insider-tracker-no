@@ -101,11 +101,14 @@ def _to_intish(x: str) -> str:
 # -----------------------------
 
 def parse_release_meta_and_text(release_url: str) -> Dict:
+    """
+    Parses metadata + extracts a cleaned announcement body_text (reduced nav/footer noise).
+    """
     html = cached_get_text(release_url)
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text("\n", strip=True)
 
-    # Date filed like: "30 Jan 2026 10:00 CET"
+    # Date filed like: "04 Feb 2026 11:51 CET"
     date_filed = ""
     m = re.search(r"\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}\s+CET\b", page_text)
     if m:
@@ -133,12 +136,29 @@ def parse_release_meta_and_text(release_url: str) -> Dict:
         if ".pdf" in href.lower():
             pdf_urls.append(norm_url(href))
 
+    # --- Clean body extraction ---
+    body_text = page_text
+
+    # Start: after the issuer line (best anchor available)
+    if issuer:
+        idx = body_text.find(issuer)
+        if idx != -1:
+            body_text = body_text[idx + len(issuer):]
+
+    # Stop: before "More information:" or source/provider blocks
+    stop_markers = ["More information:", "SOURCE", "### Source", "### Provider", "PROVIDER"]
+    stops = [body_text.find(mk) for mk in stop_markers if body_text.find(mk) != -1]
+    if stops:
+        body_text = body_text[:min(stops)]
+
+    body_text = clean(body_text)
+
     return {
         "date_filed": date_filed,
         "issuer": issuer,
         "symbol": symbol,
         "market": market,
-        "body_text": page_text,   # <-- press release text on Euronext page
+        "body_text": body_text,   # cleaned press release text
         "pdf_urls": list(dict.fromkeys(pdf_urls)),
     }
 
@@ -148,75 +168,63 @@ def parse_release_meta_and_text(release_url: str) -> Dict:
 
 def extract_trades_from_text(text: str) -> List[Dict]:
     """
-    Extract multiple people lines.
-    Handles: acquired / purchased / bought / sold
-    Works with and without "New holding is ..."
+    Extract insider trades from a cleaned press release text.
+
+    Handles patterns like:
+      "Vivian Lund, member of the Board ..., has on 4 February 2026 bought 524 shares ...
+       at a share price of NOK 288.25."
+
+    Also supports sold/acquired/purchased/bought and optional price.
     """
     t = clean(text)
-
-    # Common price line (often one price for the program day)
-    common_price = ""
-    m_price = re.search(
-        r"\bprice\s+for\s+the\s+shares\s+was\s+(?P<ccy>[A-Z]{3})\s*(?P<p>[\d]+(?:[.,]\d+)?)",
-        t,
-        re.IGNORECASE
-    )
-    if m_price:
-        common_price = f"{m_price.group('ccy').upper()} {m_price.group('p').replace(',', '.')}"
-
     trades: List[Dict] = []
 
-    # Pattern A: with "New holding is X shares"
-    pat_with_holding = re.compile(
+    # Main pattern: name, role, (has on DATE) verb shares, optional price
+    pat = re.compile(
         r"(?P<name>[A-ZÆØÅ][A-Za-zÆØÅæøå\-\.\s]+?),\s*"
-        r"(?P<role>[^,]{3,140}?),\s*.*?\b"
-        r"(?P<verb>acquired|purchased|bought|sold)\b\s*"
-        r"(?P<shares>[\d\.,\s]+)\s*shares\b.*?\b"
-        r"New\s+holding\s+is\s*(?P<own>[\d\.,\s]+)\s*shares\b",
+        r"(?P<role>[^.]{3,180}?)\s*,?\s*"
+        r"(?:has\s+on\s+(?P<tradedate>\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+)?"
+        r"(?P<verb>bought|purchased|acquired|sold)\s+"
+        r"(?P<shares>[\d\.,\s]+)\s*shares\b"
+        r"(?:.*?\bshare\s+price\s+(?:of\s+)?(?P<ccy>[A-Z]{3})\s*(?P<price>[\d]+(?:[.,]\d+)?))?",
         re.IGNORECASE
     )
 
-    for m in pat_with_holding.finditer(t):
+    for m in pat.finditer(t):
         verb = m.group("verb").lower()
-        txn = "BUY" if verb in ("acquired", "purchased", "bought") else "SELL"
+        txn = "BUY" if verb in ("bought", "purchased", "acquired") else "SELL"
+
+        ccy = (m.group("ccy") or "").upper()
+        price = (m.group("price") or "").replace(",", ".")
+        price_str = f"{ccy} {price}".strip() if ccy and price else ""
+
         trades.append({
             "Insider name": clean(m.group("name")),
             "Role": clean(m.group("role")),
             "Transaction": txn,
             "Shares": _to_intish(m.group("shares")),
-            "Price": common_price,
-            "Ownership after": _to_intish(m.group("own")),
-        })
-
-    if trades:
-        return trades
-
-    # Pattern B: without "New holding" (still capture name/role/verb/shares)
-    pat_basic = re.compile(
-        r"(?P<name>[A-ZÆØÅ][A-Za-zÆØÅæøå\-\.\s]+?),\s*"
-        r"(?P<role>[^,]{3,140}?),\s*.*?\b"
-        r"(?P<verb>acquired|purchased|bought|sold)\b\s*"
-        r"(?P<shares>[\d\.,\s]+)\s*shares\b",
-        re.IGNORECASE
-    )
-
-    for m in pat_basic.finditer(t):
-        verb = m.group("verb").lower()
-        txn = "BUY" if verb in ("acquired", "purchased", "bought") else "SELL"
-        trades.append({
-            "Insider name": clean(m.group("name")),
-            "Role": clean(m.group("role")),
-            "Transaction": txn,
-            "Shares": _to_intish(m.group("shares")),
-            "Price": common_price,
+            "Price": price_str,
             "Ownership after": "",
+            "Trade date": clean(m.group("tradedate") or ""),
         })
+
+    # Fallback: if we found trades but no price in the matched sentence, try a global price
+    if trades and not any(tr.get("Price") for tr in trades):
+        mp = re.search(
+            r"\bshare\s+price\s+(?:of\s+)?(?P<ccy>[A-Z]{3})\s*(?P<p>[\d]+(?:[.,]\d+)?)",
+            t,
+            re.IGNORECASE
+        )
+        if mp:
+            fallback_price = f"{mp.group('ccy').upper()} {mp.group('p').replace(',', '.')}"
+            for tr in trades:
+                tr["Price"] = tr["Price"] or fallback_price
 
     return trades
 
 def extract_trades_with_pdf_fallback_only_if_needed(meta: Dict) -> List[Dict]:
     """
-    1) Try extracting from the press release text on Euronext page.
+    1) Try extracting from press release text on Euronext page.
     2) ONLY if we found 0 trades: try PDFs.
     """
     trades = extract_trades_from_text(meta.get("body_text", ""))
@@ -248,12 +256,10 @@ def find_next_page_url(soup: BeautifulSoup) -> str:
     Tries to find the "next page" link in the pagination.
     Returns absolute URL or "" if none.
     """
-    # Look for rel=next first (cleanest if present)
     a = soup.find("a", attrs={"rel": "next"}, href=True)
     if a:
         return norm_url(a["href"])
 
-    # Look in all links for common "next" indicators
     for a in soup.select("a[href]"):
         txt = clean(a.get_text(" ", strip=True)).lower()
         aria = (a.get("aria-label") or "").lower()
@@ -294,7 +300,6 @@ def main():
     candidate_releases = []
     seen_links = set()
 
-    # NEW: skim first 5 pages
     for soup in fetch_listing_pages(max_pages=5):
         trs = soup.find_all("tr")
 
@@ -365,6 +370,7 @@ def main():
         market = meta.get("market") or "EURONEXT/OSLO"
         date_filed = meta.get("date_filed") or rel["released"]
 
+        # Keep your OSEBX filter as-is
         if osebx and ticker and ticker not in osebx:
             continue
 
@@ -376,7 +382,7 @@ def main():
                 row = {
                     "Unique_ID": uid,
                     "Date filed": date_filed,
-                    "Trade date": "",
+                    "Trade date": t.get("Trade date", ""),
                     "Ticker": ticker,
                     "Company": company_name,
                     "Insider name": t.get("Insider name", ""),
