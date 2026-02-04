@@ -138,7 +138,7 @@ def parse_release_meta_and_text(release_url: str) -> Dict:
         "issuer": issuer,
         "symbol": symbol,
         "market": market,
-        "body_text": page_text,   # <-- “press release directly in the search engine”
+        "body_text": page_text,   # <-- press release text on Euronext page
         "pdf_urls": list(dict.fromkeys(pdf_urls)),
     }
 
@@ -219,14 +219,12 @@ def extract_trades_with_pdf_fallback_only_if_needed(meta: Dict) -> List[Dict]:
     1) Try extracting from the press release text on Euronext page.
     2) ONLY if we found 0 trades: try PDFs.
     """
-    # 1) Press release text (Euronext page)
     trades = extract_trades_from_text(meta.get("body_text", ""))
     if trades:
         return trades
 
-    # 2) PDF fallback
     pdf_urls = meta.get("pdf_urls", []) or []
-    for pdf_url in pdf_urls[:3]:  # cap
+    for pdf_url in pdf_urls[:3]:
         try:
             pdf_path = f"data/cache_pdf/{hashlib.md5(pdf_url.encode('utf-8')).hexdigest()}.pdf"
             download_file(pdf_url, pdf_path)
@@ -242,6 +240,44 @@ def extract_trades_with_pdf_fallback_only_if_needed(meta: Dict) -> List[Dict]:
     return []
 
 # -----------------------------
+# Pagination: skim first N pages
+# -----------------------------
+
+def find_next_page_url(soup: BeautifulSoup) -> str:
+    """
+    Tries to find the "next page" link in the pagination.
+    Returns absolute URL or "" if none.
+    """
+    # Look for rel=next first (cleanest if present)
+    a = soup.find("a", attrs={"rel": "next"}, href=True)
+    if a:
+        return norm_url(a["href"])
+
+    # Look in all links for common "next" indicators
+    for a in soup.select("a[href]"):
+        txt = clean(a.get_text(" ", strip=True)).lower()
+        aria = (a.get("aria-label") or "").lower()
+        if txt in ("next", "›", ">", "→") or "next" in aria:
+            return norm_url(a.get("href", ""))
+
+    return ""
+
+def fetch_listing_pages(max_pages: int = 5):
+    """
+    Yields BeautifulSoup objects for the first max_pages pages.
+    """
+    url = URL
+    for _ in range(max_pages):
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        yield soup
+        nxt = find_next_page_url(soup)
+        if not nxt or nxt == url:
+            break
+        url = nxt
+
+# -----------------------------
 # Listing scrape
 # -----------------------------
 
@@ -255,44 +291,48 @@ def guess_ticker(text: str) -> str:
 def main():
     osebx = load_osebx("data/osebx_tickers.csv") if os.path.exists("data/osebx_tickers.csv") else set()
 
-    r = requests.get(URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    trs = soup.find_all("tr")
-
     candidate_releases = []
-    for tr in trs:
-        tds = tr.find_all("td")
-        if len(tds) < 5:
-            continue
+    seen_links = set()
 
-        cells = [clean(td.get_text(" ", strip=True)) for td in tds]
-        released = cells[0]
-        company = cells[1]
-        title = cells[2]
-        topic = cells[4]
+    # NEW: skim first 5 pages
+    for soup in fetch_listing_pages(max_pages=5):
+        trs = soup.find_all("tr")
 
-        signal_type = TOPIC_SIGNAL_MAP.get(topic)
-        if not signal_type:
-            continue
+        for tr in trs:
+            tds = tr.find_all("td")
+            if len(tds) < 5:
+                continue
 
-        a = tr.find("a", href=True)
-        if not a:
-            continue
-        link = norm_url(a["href"])
+            cells = [clean(td.get_text(" ", strip=True)) for td in tds]
+            released = cells[0]
+            company = cells[1]
+            title = cells[2]
+            topic = cells[4]
 
-        ticker_guess = guess_ticker(company)
+            signal_type = TOPIC_SIGNAL_MAP.get(topic)
+            if not signal_type:
+                continue
 
-        candidate_releases.append({
-            "released": released,
-            "company": company,
-            "title": title,
-            "topic": topic,
-            "signal_type": signal_type,
-            "ticker_guess": ticker_guess,
-            "link": link,
-        })
+            a = tr.find("a", href=True)
+            if not a:
+                continue
+            link = norm_url(a["href"])
+
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+
+            ticker_guess = guess_ticker(company)
+
+            candidate_releases.append({
+                "released": released,
+                "company": company,
+                "title": title,
+                "topic": topic,
+                "signal_type": signal_type,
+                "ticker_guess": ticker_guess,
+                "link": link,
+            })
 
     out_path = "data/insider_trades.csv"
 
@@ -355,7 +395,6 @@ def main():
                 if uid not in existing_ids:
                     new_rows.append(row)
         else:
-            # Keep a signal row even if we couldn't parse trade details
             uid = f"{link}|0"
             row = {
                 "Unique_ID": uid,
@@ -387,7 +426,7 @@ def main():
         w.writeheader()
         w.writerows(all_rows)
 
-    print(f"Candidate releases on page: {len(candidate_releases)}")
+    print(f"Candidate releases across first pages: {len(candidate_releases)}")
     print(f"Added {len(new_rows)} new rows. Total rows: {len(all_rows)}")
 
 if __name__ == "__main__":
