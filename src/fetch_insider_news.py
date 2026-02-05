@@ -4,7 +4,7 @@ import re
 import time
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 
 import requests
 from bs4 import BeautifulSoup
@@ -70,8 +70,8 @@ def download_file(url: str, out_path: str, sleep_s: float = 0.25) -> None:
 
 def try_pdf_to_text(pdf_path: str) -> str:
     """
-    Requires pdfplumber in requirements.txt to work reliably.
-    If PDF is scanned image, this often returns empty.
+    Requires pdfplumber in requirements.txt.
+    Adds page separators so multi-insider PDFs are easier to split reliably.
     """
     try:
         import pdfplumber  # type: ignore
@@ -81,26 +81,27 @@ def try_pdf_to_text(pdf_path: str) -> str:
     parts = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
+            for i, page in enumerate(pdf.pages, start=1):
                 t = page.extract_text() or ""
-                if t.strip():
-                    parts.append(t)
+                t = t.strip()
+                if t:
+                    parts.append(f"\n--- PAGE {i} ---\n{t}\n")
     except Exception:
         return ""
+
     return clean("\n".join(parts))
 
 def _to_intish(x: str) -> str:
     if x is None:
         return ""
-    # keep only digits
     x = x.replace(" ", "")
-    x = x.replace(",", "")  # 4,859 -> 4859
+    x = x.replace(",", "")
     x = re.sub(r"[^\d]", "", x)
     return x
 
 def _to_decimalish(x: str) -> str:
     """
-    Keeps decimals for prices, tolerates comma thousands and dot decimals.
+    Keeps decimals for prices/values, tolerates comma thousands and dot decimals.
     Examples:
       "288.845" -> "288.845"
       "288,845" -> "288.845"
@@ -110,15 +111,12 @@ def _to_decimalish(x: str) -> str:
     if not x:
         return ""
     s = x.replace(" ", "")
-    # If both comma and dot exist, assume comma is thousands separator
     if "," in s and "." in s:
         s = s.replace(",", "")
     else:
         s = s.replace(",", ".")
     s = re.sub(r"[^\d.]", "", s)
-    # collapse multiple dots (rare)
     if s.count(".") > 1:
-        # keep last dot as decimal separator
         parts = s.split(".")
         s = "".join(parts[:-1]) + "." + parts[-1]
     return s
@@ -200,120 +198,154 @@ def _txn_from_nature(nature: str) -> str:
 
 def parse_mar_pdf_text(pdf_text: str) -> List[Dict]:
     """
-    Parses the common MAR Article 19 notification template (like your screenshot).
-    Extracts:
+    Parses MAR Article 19 notification template PDFs.
+
+    IMPORTANT: One PDF can contain MULTIPLE insiders (one form per person/page).
+    We split into person blocks and parse each block separately.
+
+    Extracts best-effort:
       - Name
       - Position/status
-      - Nature of the transaction
+      - Nature of the transaction (BUY/SELL)
       - Price + volume
+      - Total price (Value)
       - Date of the transaction
-      - Total price (if present)
-    Handles multiple instruments/transactions if repeated blocks exist (best-effort).
     """
-    t = pdf_text
+    t = pdf_text or ""
+    if not t.strip():
+        return []
 
-    # Try to split into repeating "Details of the transaction" sections if present
-    # If not present, treat whole doc as one.
-    chunks = []
-    if re.search(r"Details of the transaction", t, re.IGNORECASE):
-        # split but keep some context
-        parts = re.split(r"Details of the transaction", t, flags=re.IGNORECASE)
-        # first part is header; subsequent parts are sections
-        for p in parts[1:]:
-            chunks.append("Details of the transaction " + p)
+    # Split into person blocks
+    person_header = r"Details of the person discharging managerial responsibilities/person closely associated"
+    if re.search(person_header, t, re.IGNORECASE):
+        blocks = re.split(rf"(?={person_header})", t, flags=re.IGNORECASE)
     else:
-        chunks = [t]
+        # fallback: split by repeated main title
+        blocks = re.split(
+            r"(?=NOTIFICATION OF TRANSACTIONS PURSUANT TO THE MARKET ABUSE REGULATION ARTICLE 19)",
+            t,
+            flags=re.IGNORECASE
+        )
 
     results: List[Dict] = []
 
-    # Global fields (often appear once)
-    name = ""
-    role = ""
-    issuer = ""
-    m = re.search(r"\bName\s+([A-ZÆØÅ][^\n]+)", t)
-    if m:
-        # This can match issuer name too; we refine below per template markers
-        pass
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
 
-    # Better: locate the "Details of the person..." block
-    m_name = re.search(r"Details of the person.*?\bName\s+([A-ZÆØÅ][A-Za-zÆØÅæøå\-\.\s]+)", t, re.IGNORECASE)
-    if m_name:
-        name = clean(m_name.group(1))
+        # Person fields
+        m_name = re.search(r"\bName\s+([A-ZÆØÅ][A-Za-zÆØÅæøå\-\.\s]+)", block, re.IGNORECASE)
+        name = clean(m_name.group(1)) if m_name else ""
 
-    m_role = re.search(r"\bPosition/status\s+([A-Za-z0-9\-\/\s]+)", t, re.IGNORECASE)
-    if m_role:
-        role = clean(m_role.group(1))
+        m_role = re.search(r"\bPosition/status\s+([A-Za-z0-9\-/\s]+)", block, re.IGNORECASE)
+        role = clean(m_role.group(1)) if m_role else ""
 
-    m_issuer = re.search(r"Details of the issuer.*?\bName\s+([A-Za-z0-9 .,&\-]+)", t, re.IGNORECASE)
-    if m_issuer:
-        issuer = clean(m_issuer.group(1))
-
-    for ch in chunks:
-        # Nature
-        m_nat = re.search(r"\bNature of the transaction\s+([A-Za-z ]+)", ch, re.IGNORECASE)
-        nature = clean(m_nat.group(1)) if m_nat else ""
-
-        # Price + volume line (common)
-        # e.g. "Price: NOK 288.845, volume: 4,859"
-        m_pv = re.search(
-            r"\bPrice\s*:\s*(?P<ccy>[A-Z]{3})\s*(?P<price>[\d\.,\s]+)\s*,?\s*volume\s*:\s*(?P<vol>[\d\.,\s]+)",
-            ch,
-            re.IGNORECASE
+        # Issuer in this block (sometimes repeated)
+        m_issuer = re.search(
+            r"Details of the issuer.*?\bName\s+([A-Za-z0-9 .,&\-]+)",
+            block,
+            re.IGNORECASE | re.DOTALL
         )
-        ccy = ""
-        price = ""
-        vol = ""
-        if m_pv:
-            ccy = m_pv.group("ccy").upper()
-            price = _to_decimalish(m_pv.group("price"))
-            vol = _to_intish(m_pv.group("vol"))
+        issuer = clean(m_issuer.group(1)) if m_issuer else ""
 
-        # Date of transaction
-        m_dt = re.search(r"\bDate of the transaction\s+(\d{4}-\d{2}-\d{2})", ch, re.IGNORECASE)
-        trade_date = clean(m_dt.group(1)) if m_dt else ""
+        # Split possible repeated transaction sections inside the same person block
+        if re.search(r"Details of the transaction", block, re.IGNORECASE):
+            txn_parts = re.split(r"Details of the transaction", block, flags=re.IGNORECASE)
+            txn_chunks = [("Details of the transaction " + p).strip() for p in txn_parts[1:] if p.strip()]
+            if not txn_chunks:
+                txn_chunks = [block]
+        else:
+            txn_chunks = [block]
 
-        # Total price
-        m_total = re.search(r"\bTotal price\s+(?P<ccy>[A-Z]{3})\s*(?P<tot>[\d\.,\s]+)", ch, re.IGNORECASE)
-        total_val = ""
-        if m_total:
-            total_val = f"{m_total.group('ccy').upper()} {_to_decimalish(m_total.group('tot'))}"
+        for ch in txn_chunks:
+            # Nature
+            m_nat = re.search(r"\bNature of the transaction\s+([A-Za-z ]+)", ch, re.IGNORECASE)
+            nature = clean(m_nat.group(1)) if m_nat else ""
+            txn = _txn_from_nature(nature)
 
-        # Fallback: volume weighted average price (sometimes appears instead of Price:)
-        if not price:
-            m_vwap = re.search(r"\bVolume weighted average price\s+([\d\.,\s]+)", ch, re.IGNORECASE)
-            if m_vwap:
-                price = _to_decimalish(m_vwap.group(1))
-                # currency often NOK in these
-                if not ccy:
-                    m_ccy = re.search(r"\bNOK\b", ch)
-                    ccy = "NOK" if m_ccy else ccy
+            # Date
+            m_dt = re.search(r"\bDate of the transaction\s+(\d{4}-\d{2}-\d{2})", ch, re.IGNORECASE)
+            trade_date = clean(m_dt.group(1)) if m_dt else ""
 
-        txn = _txn_from_nature(nature)
+            # Price + volume variations
+            # Examples:
+            # "Price: NOK 288.845, volume: 4,859"
+            # "Price: NOK 288.845 volume: 4,768"
+            m_pv = re.search(
+                r"\bPrice(?:\(s\))?\s*:\s*(?P<ccy>[A-Z]{3})\s*(?P<price>[\d\.,\s]+)"
+                r"(?:\s*,?\s*volume(?:\(s\))?\s*:\s*(?P<vol>[\d\.,\s]+))?",
+                ch,
+                re.IGNORECASE
+            )
 
-        # Only add if we have something useful
-        if any([name, vol, price, trade_date, txn]):
-            results.append({
-                "Insider name": name,
-                "Role": role,
-                "Transaction": txn,
-                "Shares": vol,
-                "Price": f"{ccy} {price}".strip() if ccy and price else (f"{ccy}".strip() if ccy else ""),
-                "Value": total_val,
-                "Ownership after": "",
-                "Trade date": trade_date,
-                "_issuer_from_pdf": issuer,
-            })
+            ccy = ""
+            price = ""
+            vol = ""
+            if m_pv:
+                ccy = (m_pv.group("ccy") or "").upper()
+                price = _to_decimalish(m_pv.group("price") or "")
+                vol = _to_intish(m_pv.group("vol") or "")
 
-    # Deduplicate identical rows (sometimes chunks repeat)
+            # Volume fallback (common in the table)
+            if not vol:
+                m_vol = re.search(r"\bAggregated information:\s*Volume\s+([\d\.,\s]+)", ch, re.IGNORECASE)
+                if m_vol:
+                    vol = _to_intish(m_vol.group(1))
+                else:
+                    m_vol2 = re.search(r"\bVolume\s+([\d\.,\s]+)", ch, re.IGNORECASE)
+                    if m_vol2:
+                        # careful: avoids catching "Volume weighted average price"
+                        if not re.search(r"Volume weighted average price", ch, re.IGNORECASE):
+                            vol = vol or _to_intish(m_vol2.group(1))
+
+            # VWAP fallback if Price: missing
+            if not price:
+                m_vwap = re.search(r"\bVolume weighted average price\s+([\d\.,\s]+)", ch, re.IGNORECASE)
+                if m_vwap:
+                    price = _to_decimalish(m_vwap.group(1))
+                    if not ccy:
+                        if re.search(r"\bNOK\b", ch):
+                            ccy = "NOK"
+
+            # Total price (Value)
+            m_total = re.search(r"\bTotal price\s+(?P<ccy>[A-Z]{3})\s*(?P<tot>[\d\.,\s]+)", ch, re.IGNORECASE)
+            total_val = ""
+            if m_total:
+                total_val = f"{m_total.group('ccy').upper()} {_to_decimalish(m_total.group('tot'))}"
+
+            # Add row if meaningful
+            if any([name, role, txn, vol, price, trade_date, total_val]):
+                results.append({
+                    "Insider name": name,
+                    "Role": role,
+                    "Transaction": txn,
+                    "Shares": vol,
+                    "Price": (f"{ccy} {price}".strip() if ccy and price else (ccy.strip() if ccy else "")),
+                    "Value": total_val,
+                    "Ownership after": "",
+                    "Trade date": trade_date,
+                    "_issuer_from_pdf": issuer,
+                })
+
+    # Deduplicate
     uniq = []
     seen = set()
     for r in results:
-        key = (r.get("Insider name",""), r.get("Role",""), r.get("Transaction",""), r.get("Shares",""),
-               r.get("Price",""), r.get("Trade date",""), r.get("Value",""))
+        key = (
+            r.get("Insider name",""),
+            r.get("Role",""),
+            r.get("Transaction",""),
+            r.get("Shares",""),
+            r.get("Price",""),
+            r.get("Trade date",""),
+            r.get("Value",""),
+        )
         if key in seen:
             continue
         seen.add(key)
         uniq.append(r)
+
     return uniq
 
 # -----------------------------
@@ -327,7 +359,6 @@ def extract_trades_from_text(text: str) -> List[Dict]:
     t = clean(text)
     trades: List[Dict] = []
 
-    # Pattern: "Name, role ..., has on <date> bought/sold <shares> shares ... at a share price of NOK <price>"
     pat = re.compile(
         r"(?P<name>[A-ZÆØÅ][A-Za-zÆØÅæøå\-\.\s]+?),\s*"
         r"(?P<role>[^.]{3,200}?)\s*,?\s*"
@@ -386,8 +417,8 @@ def extract_trades_from_text(text: str) -> List[Dict]:
 
 def extract_trades_prefer_pdf_then_fallback(meta: Dict) -> List[Dict]:
     """
-    Prefer parsing the attached PDF(s) first (generic MAR template => low misread risk).
-    If no PDF parse yields trades, fall back to HTML body_text.
+    Prefer parsing attached PDFs first (generic MAR template => lower misread risk).
+    If no PDF yields trades, fall back to HTML body_text.
     """
     pdf_urls = meta.get("pdf_urls", []) or []
     for pdf_url in pdf_urls[:3]:
@@ -403,7 +434,6 @@ def extract_trades_prefer_pdf_then_fallback(meta: Dict) -> List[Dict]:
         except Exception:
             continue
 
-    # Backup: HTML body
     return extract_trades_from_text(meta.get("body_text", ""))
 
 # -----------------------------
@@ -528,8 +558,9 @@ def main():
 
         if trades:
             # If PDF contained issuer name, prefer it
-            if trades[0].get("_issuer_from_pdf"):
-                company_name = trades[0].get("_issuer_from_pdf") or company_name
+            pdf_issuer = trades[0].get("_issuer_from_pdf")
+            if pdf_issuer:
+                company_name = pdf_issuer or company_name
 
             for i, t in enumerate(trades, start=1):
                 uid = f"{link}|{i}"
@@ -589,10 +620,6 @@ def main():
 
     print(f"Candidate releases across first pages: {len(candidate_releases)}")
     print(f"Added {len(new_rows)} new rows. Total rows: {len(all_rows)}")
-
-    # Tip in logs (helps when pdfplumber is missing)
-    if new_rows and any(r.get("Insider name","").startswith("(Aggregate") for r in new_rows):
-        print("Note: Some rows were aggregated. If you want person-level detail, ensure PDFs are parsed (pdfplumber).")
 
 if __name__ == "__main__":
     main()
