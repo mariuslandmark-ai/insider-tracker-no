@@ -4,7 +4,7 @@ import re
 import time
 import hashlib
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -70,7 +70,7 @@ def download_file(url: str, out_path: str, sleep_s: float = 0.25) -> None:
 
 def try_pdf_to_text(pdf_path: str) -> str:
     """
-    Optional: requires pdfplumber.
+    Requires pdfplumber in requirements.txt to work reliably.
     If PDF is scanned image, this often returns empty.
     """
     try:
@@ -87,14 +87,41 @@ def try_pdf_to_text(pdf_path: str) -> str:
                     parts.append(t)
     except Exception:
         return ""
-    return clean(" ".join(parts))
+    return clean("\n".join(parts))
 
 def _to_intish(x: str) -> str:
     if x is None:
         return ""
-    x = x.replace(" ", "").replace(",", "")
+    # keep only digits
+    x = x.replace(" ", "")
+    x = x.replace(",", "")  # 4,859 -> 4859
     x = re.sub(r"[^\d]", "", x)
     return x
+
+def _to_decimalish(x: str) -> str:
+    """
+    Keeps decimals for prices, tolerates comma thousands and dot decimals.
+    Examples:
+      "288.845" -> "288.845"
+      "288,845" -> "288.845"
+      "1,403,497.855" -> "1403497.855"
+      "1 403 497,855" -> "1403497.855"
+    """
+    if not x:
+        return ""
+    s = x.replace(" ", "")
+    # If both comma and dot exist, assume comma is thousands separator
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
+    s = re.sub(r"[^\d.]", "", s)
+    # collapse multiple dots (rare)
+    if s.count(".") > 1:
+        # keep last dot as decimal separator
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    return s
 
 # -----------------------------
 # Euronext detail page parsing
@@ -108,7 +135,7 @@ def parse_release_meta_and_text(release_url: str) -> Dict:
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text("\n", strip=True)
 
-    # Date filed like: "04 Feb 2026 11:51 CET"
+    # Date filed like: "05 Feb 2026 14:48 CET"
     date_filed = ""
     m = re.search(r"\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}\s+CET\b", page_text)
     if m:
@@ -138,14 +165,11 @@ def parse_release_meta_and_text(release_url: str) -> Dict:
 
     # --- Clean body extraction ---
     body_text = page_text
-
-    # Start: after the issuer line (best anchor available)
     if issuer:
         idx = body_text.find(issuer)
         if idx != -1:
             body_text = body_text[idx + len(issuer):]
 
-    # Stop: before "More information:" or source/provider blocks
     stop_markers = ["More information:", "SOURCE", "### Source", "### Provider", "PROVIDER"]
     stops = [body_text.find(mk) for mk in stop_markers if body_text.find(mk) != -1]
     if stops:
@@ -158,31 +182,155 @@ def parse_release_meta_and_text(release_url: str) -> Dict:
         "issuer": issuer,
         "symbol": symbol,
         "market": market,
-        "body_text": body_text,   # cleaned press release text
+        "body_text": body_text,
         "pdf_urls": list(dict.fromkeys(pdf_urls)),
     }
 
 # -----------------------------
-# Trade extraction (regex)
+# PDF parsing (MAR Article 19 template)
+# -----------------------------
+
+def _txn_from_nature(nature: str) -> str:
+    n = (nature or "").strip().lower()
+    if "acquisition" in n or "purchase" in n or "buy" in n:
+        return "BUY"
+    if "disposal" in n or "sale" in n or "sell" in n:
+        return "SELL"
+    return ""
+
+def parse_mar_pdf_text(pdf_text: str) -> List[Dict]:
+    """
+    Parses the common MAR Article 19 notification template (like your screenshot).
+    Extracts:
+      - Name
+      - Position/status
+      - Nature of the transaction
+      - Price + volume
+      - Date of the transaction
+      - Total price (if present)
+    Handles multiple instruments/transactions if repeated blocks exist (best-effort).
+    """
+    t = pdf_text
+
+    # Try to split into repeating "Details of the transaction" sections if present
+    # If not present, treat whole doc as one.
+    chunks = []
+    if re.search(r"Details of the transaction", t, re.IGNORECASE):
+        # split but keep some context
+        parts = re.split(r"Details of the transaction", t, flags=re.IGNORECASE)
+        # first part is header; subsequent parts are sections
+        for p in parts[1:]:
+            chunks.append("Details of the transaction " + p)
+    else:
+        chunks = [t]
+
+    results: List[Dict] = []
+
+    # Global fields (often appear once)
+    name = ""
+    role = ""
+    issuer = ""
+    m = re.search(r"\bName\s+([A-ZÆØÅ][^\n]+)", t)
+    if m:
+        # This can match issuer name too; we refine below per template markers
+        pass
+
+    # Better: locate the "Details of the person..." block
+    m_name = re.search(r"Details of the person.*?\bName\s+([A-ZÆØÅ][A-Za-zÆØÅæøå\-\.\s]+)", t, re.IGNORECASE)
+    if m_name:
+        name = clean(m_name.group(1))
+
+    m_role = re.search(r"\bPosition/status\s+([A-Za-z0-9\-\/\s]+)", t, re.IGNORECASE)
+    if m_role:
+        role = clean(m_role.group(1))
+
+    m_issuer = re.search(r"Details of the issuer.*?\bName\s+([A-Za-z0-9 .,&\-]+)", t, re.IGNORECASE)
+    if m_issuer:
+        issuer = clean(m_issuer.group(1))
+
+    for ch in chunks:
+        # Nature
+        m_nat = re.search(r"\bNature of the transaction\s+([A-Za-z ]+)", ch, re.IGNORECASE)
+        nature = clean(m_nat.group(1)) if m_nat else ""
+
+        # Price + volume line (common)
+        # e.g. "Price: NOK 288.845, volume: 4,859"
+        m_pv = re.search(
+            r"\bPrice\s*:\s*(?P<ccy>[A-Z]{3})\s*(?P<price>[\d\.,\s]+)\s*,?\s*volume\s*:\s*(?P<vol>[\d\.,\s]+)",
+            ch,
+            re.IGNORECASE
+        )
+        ccy = ""
+        price = ""
+        vol = ""
+        if m_pv:
+            ccy = m_pv.group("ccy").upper()
+            price = _to_decimalish(m_pv.group("price"))
+            vol = _to_intish(m_pv.group("vol"))
+
+        # Date of transaction
+        m_dt = re.search(r"\bDate of the transaction\s+(\d{4}-\d{2}-\d{2})", ch, re.IGNORECASE)
+        trade_date = clean(m_dt.group(1)) if m_dt else ""
+
+        # Total price
+        m_total = re.search(r"\bTotal price\s+(?P<ccy>[A-Z]{3})\s*(?P<tot>[\d\.,\s]+)", ch, re.IGNORECASE)
+        total_val = ""
+        if m_total:
+            total_val = f"{m_total.group('ccy').upper()} {_to_decimalish(m_total.group('tot'))}"
+
+        # Fallback: volume weighted average price (sometimes appears instead of Price:)
+        if not price:
+            m_vwap = re.search(r"\bVolume weighted average price\s+([\d\.,\s]+)", ch, re.IGNORECASE)
+            if m_vwap:
+                price = _to_decimalish(m_vwap.group(1))
+                # currency often NOK in these
+                if not ccy:
+                    m_ccy = re.search(r"\bNOK\b", ch)
+                    ccy = "NOK" if m_ccy else ccy
+
+        txn = _txn_from_nature(nature)
+
+        # Only add if we have something useful
+        if any([name, vol, price, trade_date, txn]):
+            results.append({
+                "Insider name": name,
+                "Role": role,
+                "Transaction": txn,
+                "Shares": vol,
+                "Price": f"{ccy} {price}".strip() if ccy and price else (f"{ccy}".strip() if ccy else ""),
+                "Value": total_val,
+                "Ownership after": "",
+                "Trade date": trade_date,
+                "_issuer_from_pdf": issuer,
+            })
+
+    # Deduplicate identical rows (sometimes chunks repeat)
+    uniq = []
+    seen = set()
+    for r in results:
+        key = (r.get("Insider name",""), r.get("Role",""), r.get("Transaction",""), r.get("Shares",""),
+               r.get("Price",""), r.get("Trade date",""), r.get("Value",""))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+    return uniq
+
+# -----------------------------
+# HTML press release parsing (backup)
 # -----------------------------
 
 def extract_trades_from_text(text: str) -> List[Dict]:
     """
-    Extract insider trades from a cleaned press release text.
-
-    Handles patterns like:
-      "Vivian Lund, member of the Board ..., has on 4 February 2026 bought 524 shares ...
-       at a share price of NOK 288.25."
-
-    Also supports sold/acquired/purchased/bought and optional price.
+    Backup parser for announcements written as free text on the Euronext page.
     """
     t = clean(text)
     trades: List[Dict] = []
 
-    # Main pattern: name, role, (has on DATE) verb shares, optional price
+    # Pattern: "Name, role ..., has on <date> bought/sold <shares> shares ... at a share price of NOK <price>"
     pat = re.compile(
         r"(?P<name>[A-ZÆØÅ][A-Za-zÆØÅæøå\-\.\s]+?),\s*"
-        r"(?P<role>[^.]{3,180}?)\s*,?\s*"
+        r"(?P<role>[^.]{3,200}?)\s*,?\s*"
         r"(?:has\s+on\s+(?P<tradedate>\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+)?"
         r"(?P<verb>bought|purchased|acquired|sold)\s+"
         r"(?P<shares>[\d\.,\s]+)\s*shares\b"
@@ -193,44 +341,54 @@ def extract_trades_from_text(text: str) -> List[Dict]:
     for m in pat.finditer(t):
         verb = m.group("verb").lower()
         txn = "BUY" if verb in ("bought", "purchased", "acquired") else "SELL"
-
         ccy = (m.group("ccy") or "").upper()
-        price = (m.group("price") or "").replace(",", ".")
+        price = _to_decimalish(m.group("price") or "")
         price_str = f"{ccy} {price}".strip() if ccy and price else ""
-
         trades.append({
             "Insider name": clean(m.group("name")),
             "Role": clean(m.group("role")),
             "Transaction": txn,
             "Shares": _to_intish(m.group("shares")),
             "Price": price_str,
+            "Value": "",
             "Ownership after": "",
             "Trade date": clean(m.group("tradedate") or ""),
         })
 
-    # Fallback: if we found trades but no price in the matched sentence, try a global price
-    if trades and not any(tr.get("Price") for tr in trades):
-        mp = re.search(
-            r"\bshare\s+price\s+(?:of\s+)?(?P<ccy>[A-Z]{3})\s*(?P<p>[\d]+(?:[.,]\d+)?)",
-            t,
-            re.IGNORECASE
-        )
-        if mp:
-            fallback_price = f"{mp.group('ccy').upper()} {mp.group('p').replace(',', '.')}"
-            for tr in trades:
-                tr["Price"] = tr["Price"] or fallback_price
-
-    return trades
-
-def extract_trades_with_pdf_fallback_only_if_needed(meta: Dict) -> List[Dict]:
-    """
-    1) Try extracting from press release text on Euronext page.
-    2) ONLY if we found 0 trades: try PDFs.
-    """
-    trades = extract_trades_from_text(meta.get("body_text", ""))
     if trades:
         return trades
 
+    # Aggregate fallback (total shares + avg price)
+    m_total = re.search(
+        r"\btotal\s+of\s+(?P<shares>[\d\.,\s]+)\s*shares\b.*?\b"
+        r"(?:average\s+price\s+per\s+share\s+of|average\s+price\s+per\s+share\s+was|at\s+an\s+average\s+price\s+per\s+share\s+of)\s*"
+        r"(?P<ccy>[A-Z]{3})\s*(?P<price>[\d]+(?:[.,]\d+)?)",
+        t,
+        re.IGNORECASE
+    )
+    if m_total:
+        shares = _to_intish(m_total.group("shares"))
+        ccy = m_total.group("ccy").upper()
+        price = _to_decimalish(m_total.group("price"))
+        trades.append({
+            "Insider name": "(Aggregate – primary insiders)",
+            "Role": "",
+            "Transaction": "BUY",
+            "Shares": shares,
+            "Price": f"{ccy} {price}",
+            "Value": "",
+            "Ownership after": "",
+            "Trade date": "",
+        })
+        return trades
+
+    return []
+
+def extract_trades_prefer_pdf_then_fallback(meta: Dict) -> List[Dict]:
+    """
+    Prefer parsing the attached PDF(s) first (generic MAR template => low misread risk).
+    If no PDF parse yields trades, fall back to HTML body_text.
+    """
     pdf_urls = meta.get("pdf_urls", []) or []
     for pdf_url in pdf_urls[:3]:
         try:
@@ -239,23 +397,20 @@ def extract_trades_with_pdf_fallback_only_if_needed(meta: Dict) -> List[Dict]:
             pdf_text = try_pdf_to_text(pdf_path)
             if not pdf_text:
                 continue
-            trades = extract_trades_from_text(pdf_text)
+            trades = parse_mar_pdf_text(pdf_text)
             if trades:
                 return trades
         except Exception:
             continue
 
-    return []
+    # Backup: HTML body
+    return extract_trades_from_text(meta.get("body_text", ""))
 
 # -----------------------------
 # Pagination: skim first N pages
 # -----------------------------
 
 def find_next_page_url(soup: BeautifulSoup) -> str:
-    """
-    Tries to find the "next page" link in the pagination.
-    Returns absolute URL or "" if none.
-    """
     a = soup.find("a", attrs={"rel": "next"}, href=True)
     if a:
         return norm_url(a["href"])
@@ -269,9 +424,6 @@ def find_next_page_url(soup: BeautifulSoup) -> str:
     return ""
 
 def fetch_listing_pages(max_pages: int = 5):
-    """
-    Yields BeautifulSoup objects for the first max_pages pages.
-    """
     url = URL
     for _ in range(max_pages):
         r = requests.get(url, headers=HEADERS, timeout=30)
@@ -302,7 +454,6 @@ def main():
 
     for soup in fetch_listing_pages(max_pages=5):
         trs = soup.find_all("tr")
-
         for tr in trs:
             tds = tr.find_all("td")
             if len(tds) < 5:
@@ -370,13 +521,16 @@ def main():
         market = meta.get("market") or "EURONEXT/OSLO"
         date_filed = meta.get("date_filed") or rel["released"]
 
-        # Keep your OSEBX filter as-is
         if osebx and ticker and ticker not in osebx:
             continue
 
-        trades = extract_trades_with_pdf_fallback_only_if_needed(meta)
+        trades = extract_trades_prefer_pdf_then_fallback(meta)
 
         if trades:
+            # If PDF contained issuer name, prefer it
+            if trades[0].get("_issuer_from_pdf"):
+                company_name = trades[0].get("_issuer_from_pdf") or company_name
+
             for i, t in enumerate(trades, start=1):
                 uid = f"{link}|{i}"
                 row = {
@@ -401,6 +555,7 @@ def main():
                 if uid not in existing_ids:
                     new_rows.append(row)
         else:
+            # Keep a signal row even if parsing failed
             uid = f"{link}|0"
             row = {
                 "Unique_ID": uid,
@@ -434,6 +589,10 @@ def main():
 
     print(f"Candidate releases across first pages: {len(candidate_releases)}")
     print(f"Added {len(new_rows)} new rows. Total rows: {len(all_rows)}")
+
+    # Tip in logs (helps when pdfplumber is missing)
+    if new_rows and any(r.get("Insider name","").startswith("(Aggregate") for r in new_rows):
+        print("Note: Some rows were aggregated. If you want person-level detail, ensure PDFs are parsed (pdfplumber).")
 
 if __name__ == "__main__":
     main()
