@@ -29,7 +29,6 @@ FIELDNAMES = [
     "Source link","Market","Topic","Signal_type","Title"
 ]
 
-# Realistic browser-like headers, not a bare "Mozilla/5.0" fingerprint
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -54,7 +53,7 @@ def make_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
         total=4,
-        backoff_factor=1.5,  # 1.5s, 3s, 6s, 12s
+        backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
@@ -206,7 +205,7 @@ def parse_release_meta_and_text(release_url: str) -> Dict:
     }
 
 # -----------------------------
-# PDF parsing (MAR Article 19 template) — unchanged logic
+# PDF parsing (MAR Article 19 template)
 # -----------------------------
 
 def _txn_from_nature(nature: str) -> str:
@@ -321,7 +320,7 @@ def parse_mar_pdf_text(pdf_text: str) -> List[Dict]:
     return uniq
 
 # -----------------------------
-# HTML press release parsing (backup) — unchanged logic
+# HTML press release parsing (backup)
 # -----------------------------
 
 def extract_trades_from_text(text: str) -> List[Dict]:
@@ -390,7 +389,7 @@ def extract_trades_prefer_pdf_then_fallback(meta: Dict) -> List[Dict]:
     return extract_trades_from_text(meta.get("body_text", ""))
 
 # -----------------------------
-# Pagination — broadened "next" detection
+# Pagination
 # -----------------------------
 
 def find_next_page_url(soup: BeautifulSoup) -> str:
@@ -415,6 +414,11 @@ def fetch_listing_pages(max_pages: int = 5):
         r = SESSION.get(url, timeout=30)
         log.info(f"Listing page {page_num}: GET {url} -> {r.status_code}, {len(r.text)} bytes")
         r.raise_for_status()
+
+        # DIAGNOSTIC: log a snippet of the raw response so we can see
+        # whether we're getting the real listing HTML or a bot-challenge page.
+        log.info(f"Response snippet: {r.text[:500]!r}")
+
         soup = BeautifulSoup(r.text, "html.parser")
 
         row_count = len(soup.find_all("tr"))
@@ -477,16 +481,16 @@ def main():
                 })
     except requests.exceptions.RequestException as e:
         log.error(f"FATAL: could not fetch listing pages: {e}")
-        sys.exit(1)  # non-zero exit -> Action run shows red, no silent failure
+        sys.exit(1)
 
     log.info(f"Total <tr> elements across all pages: {total_trs_seen}")
     log.info(f"Candidate releases matching TOPIC_SIGNAL_MAP: {len(candidate_releases)}")
 
-    # --- Fail loudly if the page structure has silently changed ---
     if total_trs_seen == 0:
         log.error(
             "FATAL: 0 <tr> elements found on the listing page. "
-            "Euronext likely changed the page markup (e.g. moved off <table>/<tr>/<td>). "
+            "Euronext likely changed the page markup or is blocking this request "
+            "(check the Response snippet log line above for a bot-challenge page). "
             "View-source the listing URL and compare to the parser's assumptions."
         )
         sys.exit(1)
