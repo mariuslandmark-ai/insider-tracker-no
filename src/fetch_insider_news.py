@@ -104,7 +104,7 @@ def extract_transactions_via_llm(body: str, message_id: str) -> List[Dict]:
         return []
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.6-luna",
             temperature=0,
             messages=[
                 {"role": "system", "content": EXTRACTION_PROMPT},
