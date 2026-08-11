@@ -1,5 +1,6 @@
 import csv
 import os
+import re
 import sys
 import time
 import logging
@@ -8,22 +9,21 @@ from typing import List, Dict
 
 import requests
 
-API_URL = "https://api3.oslo.oslobors.no/v1/newsreader/list"
+LIST_URL = "https://api3.oslo.oslobors.no/v1/newsreader/list"
+MESSAGE_URL = "https://api3.oslo.oslobors.no/v1/newsreader/message"
 
-# Category IDs discovered from the NewsWeb API response:
-# 1102 = MANAGERS' TRANSACTION (mandatory notification of trade, primary insiders)
-# 1006 = MAJOR SHAREHOLDINGS NOTIFICATION (flagging)
-# 1007 = ACQUISITION OR DISPOSAL OF AN ISSUER'S OWN SHARES (buyback)
 CATEGORY_SIGNAL_MAP = {
-    "1102": "INSIDER_TRADE",
-    "1006": "FLAGGING",
-    "1007": "BUYBACK",
+    "1102": "INSIDER_TRADE",   # MANAGERS' TRANSACTION
+    "1006": "FLAGGING",        # MAJOR SHAREHOLDINGS NOTIFICATION
+    "1007": "BUYBACK",         # ACQUISITION OR DISPOSAL OF AN ISSUER'S OWN SHARES
 }
 
 FIELDNAMES = [
     "Unique_ID", "Date filed", "Ticker", "Company", "Issuer_ID",
     "Category_no", "Category_en", "Signal_type", "Title",
-    "Market", "Num_attachments", "News_ID", "Message_URL"
+    "Insider name", "Role", "Transaction", "Shares",
+    "New_holding_shares", "New_holding_pct", "Price_NOK",
+    "Market", "Num_attachments", "News_ID", "Message_URL",
 ]
 
 HEADERS = {
@@ -46,47 +46,121 @@ logging.basicConfig(
 log = logging.getLogger("insider_tracker")
 
 
+def clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
 def fetch_messages_for_category(category_id: str, from_date: str, to_date: str) -> List[Dict]:
-    """
-    POSTs to the NewsWeb API with an empty body (all filtering is done via
-    query params). Returns the list of message dicts from data.messages.
-    """
     params = {
-        "category": category_id,
-        "issuer": "",
-        "fromDate": from_date,
-        "toDate": to_date,
-        "market": "XOSL",   # Oslo Børs only
-        "messageTitle": "",
+        "category": category_id, "issuer": "", "fromDate": from_date,
+        "toDate": to_date, "market": "XOSL", "messageTitle": "",
     }
-
-    r = requests.post(API_URL, headers=HEADERS, params=params, data="", timeout=30)
-    log.info(
-        f"Category {category_id}: POST -> {r.status_code}, "
-        f"{len(r.content)} bytes, url={r.url}"
-    )
+    r = requests.post(LIST_URL, headers=HEADERS, params=params, data="", timeout=30)
+    log.info(f"Category {category_id}: POST -> {r.status_code}, {len(r.content)} bytes")
     r.raise_for_status()
-
     payload = r.json()
-    header = payload.get("header", {})
-    if header.get("result.val") != 0:
-        log.warning(f"Category {category_id}: API returned non-OK result: {header}")
+    if payload.get("header", {}).get("result.val") != 0:
+        log.warning(f"Category {category_id}: non-OK result: {payload.get('header')}")
         return []
-
     messages = payload.get("data", {}).get("messages", [])
-    overflow = payload.get("data", {}).get("overflow", False)
-    log.info(f"Category {category_id}: {len(messages)} messages returned (overflow={overflow})")
+    log.info(f"Category {category_id}: {len(messages)} messages returned")
     return messages
 
 
+def fetch_message_body(message_id: int, sleep_s: float = 0.3) -> str:
+    time.sleep(sleep_s)
+    params = {"messageId": str(message_id)}
+    r = requests.post(MESSAGE_URL, headers=HEADERS, params=params, data="", timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("header", {}).get("result.val") != 0:
+        log.warning(f"Message {message_id}: non-OK result: {payload.get('header')}")
+        return ""
+    return payload.get("data", {}).get("message", {}).get("body", "") or ""
+
+
+# -----------------------------
+# Free-text transaction parsing
+# -----------------------------
+# Handles two observed phrasings:
+#   "NAME, ROLE of ISSUER, today VERB N shares [...]. New holding is M shares, P% of the outstanding shares."
+#   "ISSUER has today VERB N shares. New holding is M shares, P% of the outstanding shares."
+
+_PERSON_PAT = re.compile(
+    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
+    r"(?P<role>[^.,]{3,120}?),?\s*"
+    r"today\s+(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
+    r"(?P<shares>[\d,\.\s]+)\s*shares\b"
+    r"(?:.*?New holding is\s+(?P<newholding>[\d,\.\s]+)\s*shares,\s*"
+    r"(?P<pct>[\d\.]+)%\s*of the outstanding shares)?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_COMPANY_PAT = re.compile(
+    r"(?P<issuer>[A-ZÆØÅ][\w &.\-]+?)\s+has\s+today\s+"
+    r"(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
+    r"(?P<shares>[\d,\.\s]+)\s*shares\b"
+    r"(?:.*?New holding is\s+(?P<newholding>[\d,\.\s]+)\s*shares,\s*"
+    r"(?P<pct>[\d\.]+)%\s*of the outstanding shares)?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_PRICE_PAT = re.compile(
+    r"price for the shares was\s+NOK\s+([\d\.,]+)", re.IGNORECASE
+)
+
+
+def _verb_to_txn(verb: str) -> str:
+    v = verb.lower()
+    if v in ("acquired", "purchased", "bought"):
+        return "BUY"
+    if v in ("sold", "disposed of"):
+        return "SELL"
+    return ""
+
+
+def _to_int(x: str) -> str:
+    return re.sub(r"[^\d]", "", x or "")
+
+
+def parse_transactions_from_body(body: str) -> List[Dict]:
+    if not body:
+        return []
+
+    price_match = _PRICE_PAT.search(body)
+    price = price_match.group(1) if price_match else ""
+
+    results = []
+
+    for m in _PERSON_PAT.finditer(body):
+        results.append({
+            "Insider name": clean(m.group("name")),
+            "Role": clean(m.group("role")),
+            "Transaction": _verb_to_txn(m.group("verb")),
+            "Shares": _to_int(m.group("shares")),
+            "New_holding_shares": _to_int(m.group("newholding") or ""),
+            "New_holding_pct": clean(m.group("pct") or ""),
+            "Price_NOK": price,
+        })
+
+    for m in _COMPANY_PAT.finditer(body):
+        results.append({
+            "Insider name": clean(m.group("issuer")) + " (issuer)",
+            "Role": "Issuer (own-account transaction)",
+            "Transaction": _verb_to_txn(m.group("verb")),
+            "Shares": _to_int(m.group("shares")),
+            "New_holding_shares": _to_int(m.group("newholding") or ""),
+            "New_holding_pct": clean(m.group("pct") or ""),
+            "Price_NOK": price,
+        })
+
+    return results
+
+
 def main():
-    # Look back 3 days by default — the hourly cron means we rarely need more,
-    # but this gives a buffer against a missed run or API hiccup.
     to_date = datetime.now(timezone.utc).date()
     from_date = to_date - timedelta(days=3)
-
-    from_date_str = from_date.isoformat()
-    to_date_str = to_date.isoformat()
+    from_date_str, to_date_str = from_date.isoformat(), to_date.isoformat()
 
     out_path = "data/insider_trades.csv"
     existing_ids = set()
@@ -106,22 +180,21 @@ def main():
         try:
             messages = fetch_messages_for_category(category_id, from_date_str, to_date_str)
         except requests.exceptions.RequestException as e:
-            log.error(f"FATAL: request failed for category {category_id}: {e}")
+            log.error(f"FATAL: list request failed for category {category_id}: {e}")
             sys.exit(1)
 
         total_fetched += len(messages)
 
         for m in messages:
-            uid = str(m.get("messageId") or m.get("id"))
-            if not uid or uid in existing_ids:
+            base_id = str(m.get("messageId") or m.get("id"))
+            if not base_id:
                 continue
 
             cats = m.get("category", [])
             cat_no = cats[0].get("category_no", "") if cats else ""
             cat_en = cats[0].get("category_en", "") if cats else ""
 
-            new_rows.append({
-                "Unique_ID": uid,
+            base_fields = {
                 "Date filed": m.get("publishedTime", ""),
                 "Ticker": m.get("issuerSign", ""),
                 "Company": m.get("issuerName", ""),
@@ -133,16 +206,48 @@ def main():
                 "Market": ",".join(m.get("markets", [])),
                 "Num_attachments": m.get("numbAttachments", 0),
                 "News_ID": m.get("newsId", ""),
-                "Message_URL": f"https://newsweb.oslobors.no/message/{m.get('messageId', '')}",
-            })
-            existing_ids.add(uid)
+                "Message_URL": f"https://newsweb.oslobors.no/message/{base_id}",
+            }
+
+            # Only fetch + parse full body for insider-trade messages —
+            # flagging/buyback messages don't need per-person parsing here.
+            if signal_type == "INSIDER_TRADE":
+                uid_check = f"{base_id}|0"
+                if uid_check in existing_ids or any(
+                    uid.startswith(base_id + "|") for uid in existing_ids
+                ):
+                    continue
+
+                try:
+                    body = fetch_message_body(int(base_id))
+                except requests.exceptions.RequestException as e:
+                    log.warning(f"Message {base_id}: detail fetch failed: {e}")
+                    body = ""
+
+                txns = parse_transactions_from_body(body)
+
+                if txns:
+                    for i, t in enumerate(txns, start=1):
+                        uid = f"{base_id}|{i}"
+                        if uid in existing_ids:
+                            continue
+                        row = {**base_fields, **t, "Unique_ID": uid}
+                        new_rows.append(row)
+                        existing_ids.add(uid)
+                else:
+                    uid = f"{base_id}|0"
+                    row = {**base_fields, "Unique_ID": uid}
+                    new_rows.append(row)
+                    existing_ids.add(uid)
+            else:
+                if base_id in existing_ids:
+                    continue
+                row = {**base_fields, "Unique_ID": base_id}
+                new_rows.append(row)
+                existing_ids.add(base_id)
 
     log.info(f"Total messages fetched across all categories: {total_fetched}")
     log.info(f"New rows to add: {len(new_rows)}")
-
-    # Fail loudly if the API contract changed (e.g. field names renamed)
-    if total_fetched > 0 and len(new_rows) == 0 and len(existing_rows) == 0:
-        log.warning("Fetched messages but produced zero rows — check field mapping.")
 
     all_rows = existing_rows + new_rows
 
@@ -150,7 +255,8 @@ def main():
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDNAMES)
         w.writeheader()
-        w.writerows(all_rows)
+        for row in all_rows:
+            w.writerow({k: row.get(k, "") for k in FIELDNAMES})
 
     log.info(f"Added {len(new_rows)} new rows. Total rows: {len(all_rows)}")
 
