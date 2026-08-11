@@ -82,11 +82,16 @@ def fetch_message_body(message_id: int, sleep_s: float = 0.3) -> str:
 # -----------------------------
 # Free-text transaction parsing
 # -----------------------------
-# Handles two observed phrasings:
-#   "NAME, ROLE of ISSUER, today VERB N shares [...]. New holding is M shares, P% of the outstanding shares."
-#   "ISSUER has today VERB N shares. New holding is M shares, P% of the outstanding shares."
+# Four observed phrasings so far:
+#   A. "NAME, ROLE, today VERB N shares [...]. New holding is M shares, P% of the outstanding shares." (StrongPoint)
+#   B. "NAME, ROLE... has on DATE VERB N shares... at a price of NOK X per share. [...] holds M shares." (OKEA)
+#   C. "NAME, ROLE, will have N share options cancelled. [...] will hold M shares [or 'no shares']." (Elkem — not a market trade)
+#   D. "---- NAME - N shares" bullet list, RSU/PSU vesting (TGS — not a market trade)
+# Some announcements (e.g. Nordic Semiconductor) reference a prior announcement
+# and contain no extractable per-person data in the body at all — these fall
+# through to the |0 metadata-only row, which is correct, not a parsing bug.
 
-_PERSON_PAT = re.compile(
+_PERSON_TODAY_PAT = re.compile(
     r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
     r"(?P<role>[^.,]{3,120}?),?\s*"
     r"today\s+(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
@@ -96,7 +101,7 @@ _PERSON_PAT = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-_COMPANY_PAT = re.compile(
+_COMPANY_TODAY_PAT = re.compile(
     r"(?P<issuer>[A-ZÆØÅ][\w &.\-]+?)\s+has\s+today\s+"
     r"(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
     r"(?P<shares>[\d,\.\s]+)\s*shares\b"
@@ -105,13 +110,35 @@ _COMPANY_PAT = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-_PRICE_PAT = re.compile(
-    r"price for the shares was\s+NOK\s+([\d\.,]+)", re.IGNORECASE
+_PERSON_HAS_ON_PAT = re.compile(
+    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
+    r"(?P<role>[^.,]{3,150}?),?\s*"
+    r"has on\s+\d{1,2}\s+\w+\s+\d{4}\s+"
+    r"(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
+    r"(?P<shares>[\d,\.\s]+)\s*shares\b.*?"
+    r"at a price of\s+NOK\s+(?P<price>[\d\.,]+)\s*per share\."
+    r".*?holds\s+(?P<newholding>[\d,\.\s]+)\s*shares",
+    re.IGNORECASE | re.DOTALL,
 )
+
+_OPTION_CANCEL_PAT = re.compile(
+    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
+    r"(?P<role>[^.,]{3,120}?),?\s*"
+    r"will have\s+(?P<options>[\d,\.\s]+)\s*share options cancelled\."
+    r".*?will hold\s+(?P<newholding>[\d,\.\s]+|no)\s*shares",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_VESTING_BULLET_PAT = re.compile(
+    r"----\s*(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?)\s*-\s*(?P<shares>[\d,\.\s]+)\s*shares",
+    re.IGNORECASE,
+)
+
+_PRICE_PAT = re.compile(r"price for the shares was\s+NOK\s+([\d\.,]+)", re.IGNORECASE)
 
 
 def _verb_to_txn(verb: str) -> str:
-    v = verb.lower()
+    v = (verb or "").lower()
     if v in ("acquired", "purchased", "bought"):
         return "BUY"
     if v in ("sold", "disposed of"):
@@ -127,12 +154,20 @@ def parse_transactions_from_body(body: str) -> List[Dict]:
     if not body:
         return []
 
-    price_match = _PRICE_PAT.search(body)
-    price = price_match.group(1) if price_match else ""
-
     results = []
+    matched_spans = []
 
-    for m in _PERSON_PAT.finditer(body):
+    def overlaps(span):
+        return any(s <= span[0] < e or s < span[1] <= e for s, e in matched_spans)
+
+    global_price_match = _PRICE_PAT.search(body)
+    global_price = global_price_match.group(1) if global_price_match else ""
+
+    # Pattern A: "today acquired/sold ... New holding is ... %" (person)
+    for m in _PERSON_TODAY_PAT.finditer(body):
+        if overlaps(m.span()):
+            continue
+        matched_spans.append(m.span())
         results.append({
             "Insider name": clean(m.group("name")),
             "Role": clean(m.group("role")),
@@ -140,10 +175,14 @@ def parse_transactions_from_body(body: str) -> List[Dict]:
             "Shares": _to_int(m.group("shares")),
             "New_holding_shares": _to_int(m.group("newholding") or ""),
             "New_holding_pct": clean(m.group("pct") or ""),
-            "Price_NOK": price,
+            "Price_NOK": global_price,
         })
 
-    for m in _COMPANY_PAT.finditer(body):
+    # Pattern A2: "today acquired/sold ... New holding is ... %" (issuer/own-account)
+    for m in _COMPANY_TODAY_PAT.finditer(body):
+        if overlaps(m.span()):
+            continue
+        matched_spans.append(m.span())
         results.append({
             "Insider name": clean(m.group("issuer")) + " (issuer)",
             "Role": "Issuer (own-account transaction)",
@@ -151,7 +190,53 @@ def parse_transactions_from_body(body: str) -> List[Dict]:
             "Shares": _to_int(m.group("shares")),
             "New_holding_shares": _to_int(m.group("newholding") or ""),
             "New_holding_pct": clean(m.group("pct") or ""),
-            "Price_NOK": price,
+            "Price_NOK": global_price,
+        })
+
+    # Pattern B: "has on DATE sold ... at a price of NOK X per share. ... holds Y shares"
+    for m in _PERSON_HAS_ON_PAT.finditer(body):
+        if overlaps(m.span()):
+            continue
+        matched_spans.append(m.span())
+        results.append({
+            "Insider name": clean(m.group("name")),
+            "Role": clean(m.group("role")),
+            "Transaction": _verb_to_txn(m.group("verb")),
+            "Shares": _to_int(m.group("shares")),
+            "New_holding_shares": _to_int(m.group("newholding") or ""),
+            "New_holding_pct": "",
+            "Price_NOK": clean(m.group("price") or ""),
+        })
+
+    # Pattern C: option cancellations — NOT a market trade, tagged distinctly
+    for m in _OPTION_CANCEL_PAT.finditer(body):
+        if overlaps(m.span()):
+            continue
+        matched_spans.append(m.span())
+        newholding = m.group("newholding") or ""
+        results.append({
+            "Insider name": clean(m.group("name")),
+            "Role": clean(m.group("role")),
+            "Transaction": "OPTIONS_CANCELLED",
+            "Shares": _to_int(m.group("options")),
+            "New_holding_shares": "0" if "no" in newholding.lower() else _to_int(newholding),
+            "New_holding_pct": "",
+            "Price_NOK": "",
+        })
+
+    # Pattern D: RSU/PSU vesting bullet list — NOT a market trade
+    for m in _VESTING_BULLET_PAT.finditer(body):
+        if overlaps(m.span()):
+            continue
+        matched_spans.append(m.span())
+        results.append({
+            "Insider name": clean(m.group("name")),
+            "Role": "",
+            "Transaction": "VESTING",
+            "Shares": _to_int(m.group("shares")),
+            "New_holding_shares": "",
+            "New_holding_pct": "",
+            "Price_NOK": "",
         })
 
     return results
@@ -209,13 +294,8 @@ def main():
                 "Message_URL": f"https://newsweb.oslobors.no/message/{base_id}",
             }
 
-            # Only fetch + parse full body for insider-trade messages —
-            # flagging/buyback messages don't need per-person parsing here.
             if signal_type == "INSIDER_TRADE":
-                uid_check = f"{base_id}|0"
-                if uid_check in existing_ids or any(
-                    uid.startswith(base_id + "|") for uid in existing_ids
-                ):
+                if any(uid == f"{base_id}|0" or uid.startswith(base_id + "|") for uid in existing_ids):
                     continue
 
                 try:
