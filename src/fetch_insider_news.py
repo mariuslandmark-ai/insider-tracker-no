@@ -1,6 +1,6 @@
 import csv
+import json
 import os
-import re
 import sys
 import time
 import logging
@@ -8,17 +8,17 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict
 
 import requests
+from openai import OpenAI
 
 LIST_URL = "https://api3.oslo.oslobors.no/v1/newsreader/list"
 MESSAGE_URL = "https://api3.oslo.oslobors.no/v1/newsreader/message"
 
 CATEGORY_SIGNAL_MAP = {
-    "1102": "INSIDER_TRADE",   # MANAGERS' TRANSACTION
-    "1006": "FLAGGING",        # MAJOR SHAREHOLDINGS NOTIFICATION
-    "1007": "BUYBACK",         # ACQUISITION OR DISPOSAL OF AN ISSUER'S OWN SHARES
+    "1102": "INSIDER_TRADE",
+    "1006": "FLAGGING",
+    "1007": "BUYBACK",
 }
 
-# Which signal types get their full body fetched + parsed for per-person detail.
 PARSE_BODY_FOR = {"INSIDER_TRADE", "FLAGGING"}
 
 FIELDNAMES = [
@@ -48,9 +48,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("insider_tracker")
 
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+EXTRACTION_PROMPT = """You are extracting structured transaction data from a Norwegian/English stock exchange announcement (Oslo Børs / NewsWeb). The announcement may describe one or more transactions by different people or entities, in English or Norwegian, in varying phrasing.
+
+For EACH distinct transaction described (a person or entity buying, selling, or having options cancelled, or shares vesting), extract:
+- name: the person or entity's full name
+- role: their stated role/title (empty string if not stated, or "Issuer" for the company's own-account transactions)
+- transaction: one of "BUY", "SELL", "OPTIONS_CANCELLED", "VESTING", or "OTHER" if unclear
+- shares: number of shares in this transaction (integer, no commas/spaces)
+- new_holding_shares: their resulting total holding after the transaction, if stated (integer, or null)
+- new_holding_pct: their resulting ownership percentage, if stated (number, or null)
+- price_nok: price per share in NOK, if stated (number, or null)
+
+Only extract transactions that are actually described with at least a name and an action. Do not invent data. If the text describes no specific transaction (e.g. it only references a prior announcement), return an empty list.
+
+Respond with ONLY a JSON array of objects with exactly these keys: name, role, transaction, shares, new_holding_shares, new_holding_pct, price_nok. No other text, no markdown formatting, just the raw JSON array."""
+
 
 def clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+    return " ".join((s or "").split())
 
 
 def fetch_messages_for_category(category_id: str, from_date: str, to_date: str) -> List[Dict]:
@@ -82,198 +99,34 @@ def fetch_message_body(message_id: int, sleep_s: float = 0.3) -> str:
     return payload.get("data", {}).get("message", {}).get("body", "") or ""
 
 
-# -----------------------------
-# Free-text transaction parsing (English + Norwegian)
-# -----------------------------
-# INSIDER_TRADE phrasings:
-#   A. "NAME, ROLE, today VERB N shares [...]. New holding is M shares, P% of the outstanding shares." (StrongPoint)
-#   B. "NAME, ROLE... has on DATE VERB N shares... at a price of NOK X per share. [...] holds M shares." (OKEA)
-#   C. "NAME, ROLE, will have N share options cancelled. [...] will hold M shares [or 'no shares']." (Elkem — not a market trade)
-#   D. "---- NAME - N shares" bullet list, RSU/PSU vesting (TGS — not a market trade)
-# FLAGGING phrasings:
-#   E. "NAME har den DATE kjøpt/solgt N aksjer i COMPANY. [...] eier NAME totalt M aksjer [...] eierandel på P %." (Norwegian, Kistefos/Solstad)
-# Some announcements reference a prior filing and contain no extractable
-# per-person data at all — these correctly fall through to the |0 row.
-
-_PERSON_TODAY_PAT = re.compile(
-    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
-    r"(?P<role>[^.,]{3,120}?),?\s*"
-    r"today\s+(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
-    r"(?P<shares>[\d,\.\s]+)\s*shares\b"
-    r"(?:.*?New holding is\s+(?P<newholding>[\d,\.\s]+)\s*shares,\s*"
-    r"(?P<pct>[\d\.]+)%\s*of the outstanding shares)?",
-    re.IGNORECASE | re.DOTALL,
-)
-
-_COMPANY_TODAY_PAT = re.compile(
-    r"(?P<issuer>[A-ZÆØÅ][\w &.\-]+?)\s+has\s+today\s+"
-    r"(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
-    r"(?P<shares>[\d,\.\s]+)\s*shares\b"
-    r"(?:.*?New holding is\s+(?P<newholding>[\d,\.\s]+)\s*shares,\s*"
-    r"(?P<pct>[\d\.]+)%\s*of the outstanding shares)?",
-    re.IGNORECASE | re.DOTALL,
-)
-
-_PERSON_HAS_ON_PAT = re.compile(
-    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
-    r"(?P<role>[^.,]{3,150}?),?\s*"
-    r"has on\s+\d{1,2}\s+\w+\s+\d{4}\s+"
-    r"(?P<verb>acquired|purchased|bought|sold|disposed of)\s+"
-    r"(?P<shares>[\d,\.\s]+)\s*shares\b.*?"
-    r"at a price of\s+NOK\s+(?P<price>[\d\.,]+)\s*per share\."
-    r".*?holds\s+(?P<newholding>[\d,\.\s]+)\s*shares",
-    re.IGNORECASE | re.DOTALL,
-)
-
-_OPTION_CANCEL_PAT = re.compile(
-    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
-    r"(?P<role>[^.,]{3,120}?),?\s*"
-    r"will have\s+(?P<options>[\d,\.\s]+)\s*share options cancelled\."
-    r".*?will hold\s+(?P<newholding>[\d,\.\s]+|no)\s*shares",
-    re.IGNORECASE | re.DOTALL,
-)
-
-_VESTING_BULLET_PAT = re.compile(
-    r"----\s*(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?)\s*-\s*(?P<shares>[\d,\.\s]+)\s*shares",
-    re.IGNORECASE,
-)
-
-# Norwegian flagging pattern:
-# "Kistefos AS har den 10.7.26 kjøpt 333 351 aksjer i Solstad Offshore ASA («Selskapet»).
-#  Etter transaksjonen eier Kistefos AS totalt 20 668 060 aksjer i Selskapet,
-#  tilsvarende en eierandel på 25,10 %."
-_NO_FLAGGING_PAT = re.compile(
-    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?)\s+har\s+den\s+[\d.]+\s+"
-    r"(?P<verb>kjøpt|solgt)\s+(?P<shares>[\d\s]+)\s*aksjer\s+i\s+"
-    r"(?P<issuer>[\wÆØÅæøå .\-«»]+?)[.(].*?"
-    r"eier\s+(?P<name2>[A-ZÆØÅ][\wÆØÅæøå .\-]+?)\s+totalt\s+"
-    r"(?P<newholding>[\d\s]+)\s*aksjer.*?"
-    r"eierandel\s+på\s+(?P<pct>[\d,]+)\s*%",
-    re.IGNORECASE | re.DOTALL,
-)
-
-_PRICE_PAT = re.compile(r"price for the shares was\s+NOK\s+([\d\.,]+)", re.IGNORECASE)
-
-
-def _verb_to_txn(verb: str) -> str:
-    v = (verb or "").lower()
-    if v in ("acquired", "purchased", "bought", "kjøpt"):
-        return "BUY"
-    if v in ("sold", "disposed of", "solgt"):
-        return "SELL"
-    return ""
-
-
-def _to_int(x: str) -> str:
-    return re.sub(r"[^\d]", "", x or "")
-
-
-def parse_transactions_from_body(body: str) -> List[Dict]:
-    if not body:
+def extract_transactions_via_llm(body: str, message_id: str) -> List[Dict]:
+    if not body.strip():
         return []
-
-    results = []
-    matched_spans = []
-
-    def overlaps(span):
-        return any(s <= span[0] < e or s < span[1] <= e for s, e in matched_spans)
-
-    global_price_match = _PRICE_PAT.search(body)
-    global_price = global_price_match.group(1) if global_price_match else ""
-
-    # Pattern A: "today acquired/sold ... New holding is ... %" (person)
-    for m in _PERSON_TODAY_PAT.finditer(body):
-        if overlaps(m.span()):
-            continue
-        matched_spans.append(m.span())
-        results.append({
-            "Insider name": clean(m.group("name")),
-            "Role": clean(m.group("role")),
-            "Transaction": _verb_to_txn(m.group("verb")),
-            "Shares": _to_int(m.group("shares")),
-            "New_holding_shares": _to_int(m.group("newholding") or ""),
-            "New_holding_pct": clean(m.group("pct") or ""),
-            "Price_NOK": global_price,
-        })
-
-    # Pattern A2: issuer/own-account version
-    for m in _COMPANY_TODAY_PAT.finditer(body):
-        if overlaps(m.span()):
-            continue
-        matched_spans.append(m.span())
-        results.append({
-            "Insider name": clean(m.group("issuer")) + " (issuer)",
-            "Role": "Issuer (own-account transaction)",
-            "Transaction": _verb_to_txn(m.group("verb")),
-            "Shares": _to_int(m.group("shares")),
-            "New_holding_shares": _to_int(m.group("newholding") or ""),
-            "New_holding_pct": clean(m.group("pct") or ""),
-            "Price_NOK": global_price,
-        })
-
-    # Pattern B: "has on DATE sold ... at a price of NOK X per share. ... holds Y shares"
-    for m in _PERSON_HAS_ON_PAT.finditer(body):
-        if overlaps(m.span()):
-            continue
-        matched_spans.append(m.span())
-        results.append({
-            "Insider name": clean(m.group("name")),
-            "Role": clean(m.group("role")),
-            "Transaction": _verb_to_txn(m.group("verb")),
-            "Shares": _to_int(m.group("shares")),
-            "New_holding_shares": _to_int(m.group("newholding") or ""),
-            "New_holding_pct": "",
-            "Price_NOK": clean(m.group("price") or ""),
-        })
-
-    # Pattern C: option cancellations — NOT a market trade
-    for m in _OPTION_CANCEL_PAT.finditer(body):
-        if overlaps(m.span()):
-            continue
-        matched_spans.append(m.span())
-        newholding = m.group("newholding") or ""
-        results.append({
-            "Insider name": clean(m.group("name")),
-            "Role": clean(m.group("role")),
-            "Transaction": "OPTIONS_CANCELLED",
-            "Shares": _to_int(m.group("options")),
-            "New_holding_shares": "0" if "no" in newholding.lower() else _to_int(newholding),
-            "New_holding_pct": "",
-            "Price_NOK": "",
-        })
-
-    # Pattern D: RSU/PSU vesting bullet list — NOT a market trade
-    for m in _VESTING_BULLET_PAT.finditer(body):
-        if overlaps(m.span()):
-            continue
-        matched_spans.append(m.span())
-        results.append({
-            "Insider name": clean(m.group("name")),
-            "Role": "",
-            "Transaction": "VESTING",
-            "Shares": _to_int(m.group("shares")),
-            "New_holding_shares": "",
-            "New_holding_pct": "",
-            "Price_NOK": "",
-        })
-
-    # Pattern E: Norwegian flagging — "X har den DATE kjøpt/solgt N aksjer i Y ... eier X totalt M aksjer ... eierandel på P %"
-    for m in _NO_FLAGGING_PAT.finditer(body):
-        if overlaps(m.span()):
-            continue
-        matched_spans.append(m.span())
-        pct = clean(m.group("pct") or "").replace(",", ".")
-        results.append({
-            "Insider name": clean(m.group("name")),
-            "Role": "Major shareholder",
-            "Transaction": _verb_to_txn(m.group("verb")),
-            "Shares": _to_int(m.group("shares")),
-            "New_holding_shares": _to_int(m.group("newholding") or ""),
-            "New_holding_pct": pct,
-            "Price_NOK": "",
-        })
-
-    return results
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": EXTRACTION_PROMPT},
+                {"role": "user", "content": body},
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            log.warning(f"Message {message_id}: LLM returned non-list JSON, skipping")
+            return []
+        return parsed
+    except json.JSONDecodeError as e:
+        log.warning(f"Message {message_id}: LLM returned invalid JSON: {e}")
+        return []
+    except Exception as e:
+        log.warning(f"Message {message_id}: LLM extraction failed: {e}")
+        return []
 
 
 def main():
@@ -294,6 +147,7 @@ def main():
 
     new_rows = []
     total_fetched = 0
+    llm_calls = 0
 
     for category_id, signal_type in CATEGORY_SIGNAL_MAP.items():
         try:
@@ -338,14 +192,25 @@ def main():
                     log.warning(f"Message {base_id}: detail fetch failed: {e}")
                     body = ""
 
-                txns = parse_transactions_from_body(body)
+                txns = extract_transactions_via_llm(body, base_id)
+                llm_calls += 1
 
                 if txns:
                     for i, t in enumerate(txns, start=1):
                         uid = f"{base_id}|{i}"
                         if uid in existing_ids:
                             continue
-                        row = {**base_fields, **t, "Unique_ID": uid}
+                        row = {
+                            **base_fields,
+                            "Unique_ID": uid,
+                            "Insider name": clean(t.get("name", "")),
+                            "Role": clean(t.get("role", "")),
+                            "Transaction": clean(t.get("transaction", "")).upper(),
+                            "Shares": t.get("shares") or "",
+                            "New_holding_shares": t.get("new_holding_shares") or "",
+                            "New_holding_pct": t.get("new_holding_pct") or "",
+                            "Price_NOK": t.get("price_nok") or "",
+                        }
                         new_rows.append(row)
                         existing_ids.add(uid)
                 else:
@@ -361,6 +226,7 @@ def main():
                 existing_ids.add(base_id)
 
     log.info(f"Total messages fetched across all categories: {total_fetched}")
+    log.info(f"LLM extraction calls made: {llm_calls}")
     log.info(f"New rows to add: {len(new_rows)}")
 
     all_rows = existing_rows + new_rows
