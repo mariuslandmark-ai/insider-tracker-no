@@ -18,6 +18,9 @@ CATEGORY_SIGNAL_MAP = {
     "1007": "BUYBACK",         # ACQUISITION OR DISPOSAL OF AN ISSUER'S OWN SHARES
 }
 
+# Which signal types get their full body fetched + parsed for per-person detail.
+PARSE_BODY_FOR = {"INSIDER_TRADE", "FLAGGING"}
+
 FIELDNAMES = [
     "Unique_ID", "Date filed", "Ticker", "Company", "Issuer_ID",
     "Category_no", "Category_en", "Signal_type", "Title",
@@ -80,16 +83,17 @@ def fetch_message_body(message_id: int, sleep_s: float = 0.3) -> str:
 
 
 # -----------------------------
-# Free-text transaction parsing
+# Free-text transaction parsing (English + Norwegian)
 # -----------------------------
-# Four observed phrasings so far:
+# INSIDER_TRADE phrasings:
 #   A. "NAME, ROLE, today VERB N shares [...]. New holding is M shares, P% of the outstanding shares." (StrongPoint)
 #   B. "NAME, ROLE... has on DATE VERB N shares... at a price of NOK X per share. [...] holds M shares." (OKEA)
 #   C. "NAME, ROLE, will have N share options cancelled. [...] will hold M shares [or 'no shares']." (Elkem — not a market trade)
 #   D. "---- NAME - N shares" bullet list, RSU/PSU vesting (TGS — not a market trade)
-# Some announcements (e.g. Nordic Semiconductor) reference a prior announcement
-# and contain no extractable per-person data in the body at all — these fall
-# through to the |0 metadata-only row, which is correct, not a parsing bug.
+# FLAGGING phrasings:
+#   E. "NAME har den DATE kjøpt/solgt N aksjer i COMPANY. [...] eier NAME totalt M aksjer [...] eierandel på P %." (Norwegian, Kistefos/Solstad)
+# Some announcements reference a prior filing and contain no extractable
+# per-person data at all — these correctly fall through to the |0 row.
 
 _PERSON_TODAY_PAT = re.compile(
     r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?),\s*"
@@ -134,14 +138,28 @@ _VESTING_BULLET_PAT = re.compile(
     re.IGNORECASE,
 )
 
+# Norwegian flagging pattern:
+# "Kistefos AS har den 10.7.26 kjøpt 333 351 aksjer i Solstad Offshore ASA («Selskapet»).
+#  Etter transaksjonen eier Kistefos AS totalt 20 668 060 aksjer i Selskapet,
+#  tilsvarende en eierandel på 25,10 %."
+_NO_FLAGGING_PAT = re.compile(
+    r"(?P<name>[A-ZÆØÅ][\wÆØÅæøå .\-]+?)\s+har\s+den\s+[\d.]+\s+"
+    r"(?P<verb>kjøpt|solgt)\s+(?P<shares>[\d\s]+)\s*aksjer\s+i\s+"
+    r"(?P<issuer>[\wÆØÅæøå .\-«»]+?)[.(].*?"
+    r"eier\s+(?P<name2>[A-ZÆØÅ][\wÆØÅæøå .\-]+?)\s+totalt\s+"
+    r"(?P<newholding>[\d\s]+)\s*aksjer.*?"
+    r"eierandel\s+på\s+(?P<pct>[\d,]+)\s*%",
+    re.IGNORECASE | re.DOTALL,
+)
+
 _PRICE_PAT = re.compile(r"price for the shares was\s+NOK\s+([\d\.,]+)", re.IGNORECASE)
 
 
 def _verb_to_txn(verb: str) -> str:
     v = (verb or "").lower()
-    if v in ("acquired", "purchased", "bought"):
+    if v in ("acquired", "purchased", "bought", "kjøpt"):
         return "BUY"
-    if v in ("sold", "disposed of"):
+    if v in ("sold", "disposed of", "solgt"):
         return "SELL"
     return ""
 
@@ -178,7 +196,7 @@ def parse_transactions_from_body(body: str) -> List[Dict]:
             "Price_NOK": global_price,
         })
 
-    # Pattern A2: "today acquired/sold ... New holding is ... %" (issuer/own-account)
+    # Pattern A2: issuer/own-account version
     for m in _COMPANY_TODAY_PAT.finditer(body):
         if overlaps(m.span()):
             continue
@@ -208,7 +226,7 @@ def parse_transactions_from_body(body: str) -> List[Dict]:
             "Price_NOK": clean(m.group("price") or ""),
         })
 
-    # Pattern C: option cancellations — NOT a market trade, tagged distinctly
+    # Pattern C: option cancellations — NOT a market trade
     for m in _OPTION_CANCEL_PAT.finditer(body):
         if overlaps(m.span()):
             continue
@@ -236,6 +254,22 @@ def parse_transactions_from_body(body: str) -> List[Dict]:
             "Shares": _to_int(m.group("shares")),
             "New_holding_shares": "",
             "New_holding_pct": "",
+            "Price_NOK": "",
+        })
+
+    # Pattern E: Norwegian flagging — "X har den DATE kjøpt/solgt N aksjer i Y ... eier X totalt M aksjer ... eierandel på P %"
+    for m in _NO_FLAGGING_PAT.finditer(body):
+        if overlaps(m.span()):
+            continue
+        matched_spans.append(m.span())
+        pct = clean(m.group("pct") or "").replace(",", ".")
+        results.append({
+            "Insider name": clean(m.group("name")),
+            "Role": "Major shareholder",
+            "Transaction": _verb_to_txn(m.group("verb")),
+            "Shares": _to_int(m.group("shares")),
+            "New_holding_shares": _to_int(m.group("newholding") or ""),
+            "New_holding_pct": pct,
             "Price_NOK": "",
         })
 
@@ -294,7 +328,7 @@ def main():
                 "Message_URL": f"https://newsweb.oslobors.no/message/{base_id}",
             }
 
-            if signal_type == "INSIDER_TRADE":
+            if signal_type in PARSE_BODY_FOR:
                 if any(uid == f"{base_id}|0" or uid.startswith(base_id + "|") for uid in existing_ids):
                     continue
 
